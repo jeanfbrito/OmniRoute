@@ -392,6 +392,84 @@ async function getMiniMaxUsage(apiKey: string, provider: "minimax" | "minimax-cn
   };
 }
 
+// CrofAI surfaces a tiny endpoint with two signals:
+//   GET https://crof.ai/usage_api/  →  { usable_requests: number|null, credits: number }
+// `usable_requests` is the daily request bucket on a subscription plan; `null`
+// for pay-as-you-go. `credits` is the USD credit balance. We surface both as
+// quotas so the Limits & Quotas page can render whichever the account uses.
+async function getCrofUsage(apiKey: string) {
+  if (!apiKey) {
+    return { message: "CrofAI API key not available. Add a key to view usage." };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch("https://crof.ai/usage_api/", {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+    });
+  } catch (error) {
+    return { message: `CrofAI connected. Unable to fetch usage: ${(error as Error).message}` };
+  }
+
+  const rawText = await response.text();
+
+  if (response.status === 401 || response.status === 403) {
+    return { message: "CrofAI connected. The API key was rejected by /usage_api/." };
+  }
+
+  if (!response.ok) {
+    return { message: `CrofAI connected. /usage_api/ returned HTTP ${response.status}.` };
+  }
+
+  let payload: JsonRecord = {};
+  if (rawText) {
+    try {
+      payload = toRecord(JSON.parse(rawText));
+    } catch {
+      return { message: "CrofAI connected. Unable to parse /usage_api/ response." };
+    }
+  }
+
+  const usableRequestsRaw = payload["usable_requests"];
+  const usableRequests =
+    usableRequestsRaw === null || usableRequestsRaw === undefined
+      ? null
+      : toNumber(usableRequestsRaw, 0);
+  const credits = toNumber(payload["credits"], 0);
+
+  const quotas: Record<string, UsageQuota> = {};
+
+  if (usableRequests !== null) {
+    // We only know what's left, not the daily allotment, so surface remaining
+    // as a non-bucket quota rather than guessing a percent.
+    quotas["Requests Today"] = {
+      used: 0,
+      total: 0,
+      remaining: Math.max(0, usableRequests),
+      resetAt: null,
+      unlimited: false,
+      displayName: `Requests Today: ${Math.max(0, usableRequests)} left`,
+    };
+  }
+
+  // Credits are an open balance — render as unlimited so the UI shows the
+  // dollar value rather than a misleading 0/0 bar.
+  quotas["Credits"] = {
+    used: 0,
+    total: 0,
+    remaining: 0,
+    resetAt: null,
+    unlimited: true,
+    displayName: `Credits: $${credits.toFixed(4)}`,
+  };
+
+  return { quotas };
+}
+
 async function getGlmUsage(apiKey: string, providerSpecificData?: Record<string, unknown>) {
   const quotaUrl = getGlmQuotaUrl(providerSpecificData);
 
@@ -510,6 +588,8 @@ export async function getUsageForProvider(connection) {
     case "minimax":
     case "minimax-cn":
       return await getMiniMaxUsage(apiKey, provider);
+    case "crof":
+      return await getCrofUsage(apiKey);
     case "cursor":
       return await getCursorUsage(accessToken);
     case "bailian-coding-plan":
